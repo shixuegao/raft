@@ -1,0 +1,28 @@
+# 事件队列大小上限
+maxEventSize: 2048
+# 实体大小(byte)上限
+maxEntrySize: 4096
+# 日志一次性处理数量上限
+maxHandleSize: 256
+# 日志容量扩充值
+logAppendSize: 1024
+# 读数据超时(ms)
+readTimeout: 5000
+# 心跳周期(ms)
+heartbeatInterval: 30
+# 投票发送周期(ms)
+voteInterval: 50
+# 本地服务
+local:
+  id: 1
+  addr: localhost:10000
+# 其他服务
+cluster:
+  - id: 2
+    addr: localhost:10001
+  - id: 3
+    addr: localhost:10002
+  - id: 4
+    addr: localhost:10003
+  - id: 5
+    addr: localhost:10004
