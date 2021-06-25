@@ -279,6 +279,9 @@ func (s *Server) loopLeader() {
 	s.peerConvert(stateSend)
 	defer s.peerConvert(stateWait)
 
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-s.context.Done():
@@ -304,7 +307,12 @@ func (s *Server) loopLeader() {
 				s.handleClientReq(e)
 			}
 		default:
+		}
+		//refresh commitIndex
+		select {
+		case <-ticker.C:
 			s.updateCommitIndex()
+		default:
 		}
 	}
 }
