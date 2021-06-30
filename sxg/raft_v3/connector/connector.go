@@ -38,6 +38,10 @@ func (c *Connector) CloseConn() error {
 	return c.conn.Close()
 }
 
+func (c *Connector) RemoteID() uint64 {
+	return c.remoteID
+}
+
 func (c *Connector) SetRemoteID(id uint64) {
 	c.remoteID = id
 }
@@ -72,8 +76,6 @@ func (c *Connector) Exchange(data protocol.WrapperData) (*protocol.Wrapper, erro
 func (c *Connector) Send(data protocol.WrapperData) (byte, uint32, error) {
 	var reqType byte = 0xff
 	switch data.(type) {
-	case *protocol.Basic:
-		reqType = protocol.TypeBasic
 	case *protocol.Entry:
 		reqType = protocol.TypeEntry
 	case *protocol.EntryResp:
@@ -123,11 +125,7 @@ func (c *Connector) Read() (wrapper *protocol.Wrapper, err error) {
 	_assertReader(c.reader, buf[:4])
 	tempWrapper.Number = binary.BigEndian.Uint32(buf[:4])
 	//data
-	if tempWrapper.RequestType == protocol.TypeBasic {
-		tempWrapper.Data = c.readBasic(buf)
-	} else if tempWrapper.RequestType == protocol.TypeBasicResp {
-		tempWrapper.Data = c.readBasicResp(buf)
-	} else if tempWrapper.RequestType == protocol.TypeEntry {
+	if tempWrapper.RequestType == protocol.TypeEntry {
 		tempWrapper.Data = c.readEntry(buf)
 	} else if tempWrapper.RequestType == protocol.TypeEntryResp {
 		tempWrapper.Data = c.readEntryResp(buf)
@@ -139,22 +137,6 @@ func (c *Connector) Read() (wrapper *protocol.Wrapper, err error) {
 		err = fmt.Errorf("未知的请求类型: %v", tempWrapper.RequestType)
 	}
 	return
-}
-
-func (c *Connector) readBasic(buf []byte) *protocol.Basic {
-	basic := protocol.NewBasic(0)
-	//ID
-	_assertReader(c.reader, buf[:8])
-	basic.ID = binary.BigEndian.Uint64(buf[:8])
-	return basic
-}
-
-func (c *Connector) readBasicResp(buf []byte) *protocol.BasicResp {
-	resp := protocol.NewBasicResp(0)
-	//Success
-	_assertReader(c.reader, buf[:1])
-	resp.Success = buf[0]
-	return resp
 }
 
 func (c *Connector) readEntry(buf []byte) *protocol.Entry {
@@ -273,8 +255,6 @@ func _assertReader(reader *bufio.Reader, p []byte) {
 
 func _matchType(sendType, readType byte) bool {
 	switch sendType {
-	case protocol.TypeBasic:
-		return readType == protocol.TypeBasicResp
 	case protocol.TypeEntry:
 		return readType == protocol.TypeEntryResp
 	case protocol.TypeVote:

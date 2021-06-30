@@ -3,9 +3,7 @@ package protocol
 import "encoding/binary"
 
 const (
-	TypeBasic = iota
-	TypeBasicResp
-	TypeVote
+	TypeVote = iota
 	TypeVoteResp
 	TypeEntry
 	TypeEntryResp
@@ -42,10 +40,6 @@ func (w *Wrapper) ToBytes() []byte {
 	size += 4
 	copy(bs[size:], bsData)
 	return bs
-}
-
-func (w *Wrapper) GetBasic() *Basic {
-	return w.Data.(*Basic)
 }
 
 func (w *Wrapper) GetVote() *Vote {

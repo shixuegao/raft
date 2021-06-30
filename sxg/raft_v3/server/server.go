@@ -36,15 +36,60 @@ func roleDescribe(role int) string {
 type FuncBytesToLogEntries func(p []byte) ([]log.LogEntry, error)
 type FuncNewLogEntry func(data []byte) log.LogEntry
 
+type VoteBox struct {
+	role    int32
+	term    uint64
+	voteFor uint64
+}
+
+func (vb *VoteBox) Term() uint64 {
+	return atomic.LoadUint64(&vb.term)
+}
+
+func (vb *VoteBox) SetTerm(term uint64) {
+	if term >= vb.term {
+		atomic.StoreUint64(&vb.term, term)
+	}
+}
+
+func (vb *VoteBox) Role() int32 {
+	return atomic.LoadInt32(&vb.role)
+}
+
+func (vb *VoteBox) SetRole(role int32) {
+	atomic.StoreInt32(&vb.role, role)
+}
+
+func (vb *VoteBox) VoteFor() uint64 {
+	return atomic.LoadUint64(&vb.voteFor)
+}
+
+func (vb *VoteBox) SetVoteFor(id uint64) {
+	atomic.StoreUint64(&vb.voteFor, id)
+}
+
+func (vb *VoteBox) ConvertToFollower(term, id uint64) {
+	atomic.StoreInt32(&vb.role, Follower)
+	atomic.StoreUint64(&vb.term, term)
+	atomic.StoreUint64(&vb.voteFor, id)
+}
+
+func (vb *VoteBox) LaunchVote(id uint64) uint64 {
+	atomic.StoreUint64(&vb.voteFor, id)
+	return atomic.AddUint64(&vb.term, 1)
+}
+
+func NewVoteBox() *VoteBox {
+	return &VoteBox{role: Follower}
+}
+
 type Server struct {
+	*VoteBox
 	config                *config.Config
 	context               context.Context
 	cancel                context.CancelFunc
-	role                  int32
-	term                  uint64
-	votedFor              uint64
 	listener              *net.TCPListener
-	peers                 *sync.Map
+	peers                 *Peers
 	logManager            *log.LogManager
 	stateMachine          *statemachine.StateMachine
 	wait                  *sync.WaitGroup
@@ -57,6 +102,7 @@ type Server struct {
 
 func (s *Server) Open() {
 	s.listen()
+	s.peers.start()
 	s.loop()
 	s.apply()
 	s.notify()
@@ -66,10 +112,7 @@ func (s *Server) Close() {
 	s.cancel()
 	s.listener.Close()
 	s.eventQueue.Close()
-	s.peers.Range(func(key, value interface{}) bool {
-		(value.(*Peer)).stop()
-		return true
-	})
+	s.peers.stop()
 	s.wait.Wait()
 }
 
@@ -103,11 +146,6 @@ func (s *Server) handleConn(conn *net.TCPConn) {
 		remoteAddr := conn.RemoteAddr().String()
 		connector := connector.NewConnector1(0, conn, s.config.MaxEntrySize, s.readTimeout())
 		defer connector.CloseConn()
-		ok, id := s.preHandleConnector(remoteAddr, connector)
-		if !ok {
-			return
-		}
-		connector.SetRemoteID(id)
 		for {
 			select {
 			case <-s.context.Done():
@@ -117,46 +155,30 @@ func (s *Server) handleConn(conn *net.TCPConn) {
 			wrapper, err := connector.Read()
 			if err != nil {
 				if err == io.EOF {
-					s.logger.Infof("远端[Addr: %v, ID: %v]连接已关闭", remoteAddr, id)
+					s.logger.Infof("远端[Addr: %v, ID: %v]连接已关闭", remoteAddr, connector.RemoteID())
 				} else {
-					s.logger.Warnf("从远端[Addr: %v, ID: %v]读取信息异常-->%v", remoteAddr, id, err.Error())
+					s.logger.Warnf("从远端[Addr: %v, ID: %v]读取信息异常-->%v", remoteAddr, connector.RemoteID(), err.Error())
 				}
 				return
+			}
+			if connector.RemoteID() == 0 {
+				var id uint64 = 0
+				switch wrapper.RequestType {
+				case protocol.TypeEntry:
+					id = wrapper.GetEntry().LeaderID
+				case protocol.TypeVote:
+					id = wrapper.GetVote().CandidateID
+				}
+				if id != 0 && !s.peers.isPeerMember(id) {
+					s.logger.Warnf("收到远端[Addr: %v, ID: %v]的请求, 但该远端不在列表内", remoteAddr, id)
+					return
+				}
+				connector.SetRemoteID(id)
 			}
 			event := event.NewRemoteEvent(wrapper, connector)
 			s.eventQueue.PutSync(event)
 		}
 	}()
-}
-
-func (s *Server) preHandleConnector(remoteAddr string, connector *connector.Connector) (bool, uint64) {
-	//recv basic
-	wrapper, err := connector.Read()
-	if err != nil {
-		s.logger.Warnf("从远端[Addr: %v]读取Basic信息异常-->%v", remoteAddr, err.Error())
-		return false, 0
-	}
-	if wrapper.RequestType != protocol.TypeBasic {
-		s.logger.Warnf("从远端[Addr: %v]TCP第一次读取的数据不为Basic信息", remoteAddr)
-		return false, 0
-	}
-	basic := wrapper.GetBasic()
-	_, ok := s.peers.Load(basic.ID)
-	if !ok {
-		s.logger.Warnf("远端连接[Addr: %v]所代表的[ID: %v]不存在", remoteAddr, basic.ID)
-		err = sendBasicResp(connector, protocol.Failure)
-		if err != nil {
-			s.logger.Warnf("回送Basic应答信息到远端[Addr: %v]异常-->%v", remoteAddr, err.Error())
-		}
-		return false, 0
-	}
-	//send basic resp
-	err = sendBasicResp(connector, protocol.Success)
-	if err != nil {
-		s.logger.Warnf("回送Basic应答信息到远端[Addr: %v]异常-->%v", remoteAddr, err.Error())
-		return false, 0
-	}
-	return true, basic.ID
 }
 
 func (s *Server) readTimeout() time.Duration {
@@ -171,39 +193,15 @@ func (s *Server) voteInterval() time.Duration {
 	return time.Duration(s.config.VoteInterval) * time.Millisecond
 }
 
-func (s *Server) currentTerm() uint64 {
-	return atomic.LoadUint64(&s.term)
-}
-
-func (s *Server) increaseTerm() uint64 {
-	return atomic.AddUint64(&s.term, 1)
-}
-
-func (s *Server) setTerm(term uint64) {
-	atomic.StoreUint64(&s.term, term)
-}
-
-func (s *Server) currentRole() int {
-	return int(atomic.LoadInt32(&s.role))
-}
-
-func (s *Server) convertToRole(role int32) {
-	atomic.StoreInt32(&s.role, role)
-}
-
-func (s *Server) voteFor(id uint64) {
-	atomic.StoreUint64(&s.votedFor, id)
-}
-
 func NewServer(config *config.Config, logManager *log.LogManager,
 	stateMachine *statemachine.StateMachine, logger logI.Logger,
 	f1 FuncBytesToLogEntries, f2 FuncNewLogEntry) (*Server, error) {
 	server := Server{
+		VoteBox:               NewVoteBox(),
 		config:                config,
 		logManager:            logManager,
 		stateMachine:          stateMachine,
 		wait:                  new(sync.WaitGroup),
-		votedFor:              0,
 		logger:                logger,
 		eventQueue:            event.NewEventQueue(config.MaxEventSize),
 		funcBytesToLogEntries: f1,
@@ -219,14 +217,10 @@ func NewServer(config *config.Config, logManager *log.LogManager,
 		server.listener = listener
 	}
 	//Term
-	_, server.term = logManager.LastInfo()
+	_, term := logManager.LastInfo()
+	server.SetTerm(term)
 	//peers
-	server.peers = new(sync.Map)
-	for _, s := range config.Cluster {
-		peer := NewPeer(config.Local.ID, s.ID, s.Addr, &server)
-		server.peers.Store(s.ID, peer)
-		peer.start()
-	}
+	server.peers = NewPeers(config, &server)
 	return &server, nil
 }
 
@@ -240,12 +234,4 @@ func newTcpListener(addr string) (*net.TCPListener, error) {
 		return nil, err
 	}
 	return tcpListener, nil
-}
-
-func sendBasicResp(connector *connector.Connector, success byte) error {
-	resp := protocol.NewBasicResp(success)
-	if _, _, err := connector.Send(resp); err != nil {
-		return err
-	}
-	return nil
 }

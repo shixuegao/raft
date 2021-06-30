@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sxg/raft/v3/config"
 	"sxg/raft/v3/connector"
 	"sxg/raft/v3/log"
 	"sxg/raft/v3/protocol"
@@ -17,6 +18,56 @@ const (
 	stateWait = iota
 	stateSend
 )
+
+type Peers struct {
+	lock  *sync.Mutex
+	peers map[uint64]*Peer
+}
+
+func (p *Peers) start() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	for _, v := range p.peers {
+		v.start()
+	}
+}
+
+func (p *Peers) stop() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	for _, v := range p.peers {
+		v.stop()
+	}
+}
+
+func (p *Peers) foreach(f func(peer *Peer) bool) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	for _, v := range p.peers {
+		if !f(v) {
+			break
+		}
+	}
+}
+
+func (p *Peers) isPeerMember(id uint64) bool {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	for _, v := range p.peers {
+		if v.peerID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func NewPeers(config *config.Config, server *Server) *Peers {
+	p := Peers{lock: new(sync.Mutex), peers: map[uint64]*Peer{}}
+	for _, v := range config.Cluster {
+		p.peers[v.ID] = NewPeer(config.Local.ID, v.ID, v.Addr, server)
+	}
+	return &p
+}
 
 //Peer works after leader on
 type Peer struct {
@@ -131,8 +182,8 @@ func (p *Peer) vote(server *Server, term uint64,
 		c <- 0
 		for {
 			//重新选举或者角色转变则退出
-			if server.currentTerm() != term ||
-				server.currentRole() != Candidate {
+			if server.Term() != term ||
+				server.Role() != Candidate {
 				break
 			}
 			lastIndex, lastTerm := server.logManager.LastInfo()
@@ -160,24 +211,12 @@ func (p *Peer) initConn(maxEntrySize int, readTimeout time.Duration) (*connector
 	if err != nil {
 		return nil, err
 	}
-	//send basic
-	basic := protocol.NewBasic(p.leaderID)
-	wrapper, err := conn.Exchange(basic)
-	if err != nil {
-		conn.CloseConn()
-		return nil, err
-	}
-	resp := wrapper.Data.(*protocol.BasicResp)
-	if resp.Success == protocol.Failure {
-		conn.CloseConn()
-		return nil, fmt.Errorf("基本信息确认失败")
-	}
 	return conn, nil
 }
 
 func (p *Peer) intervalInteraction() {
 	if p.state == stateWait ||
-		p.server.currentRole() != Leader ||
+		p.server.Role() != Leader ||
 		p.conn == nil {
 		return
 	}
@@ -197,7 +236,7 @@ func (p *Peer) intervalInteraction() {
 }
 
 func (p *Peer) handleEntryResp(resp *protocol.EntryResp, lastIndex uint64) {
-	term := p.server.currentTerm()
+	term := p.server.Term()
 	if term < resp.Term {
 		//忽略, 等其他Header发送Entry来转变当前Server的状态
 	} else if term == resp.Term {
@@ -223,12 +262,13 @@ func (p *Peer) handleEntryResp(resp *protocol.EntryResp, lastIndex uint64) {
 		if index, ok := p.server.logManager.LastIndexOfTerm(resp.Term); ok {
 			p.prevLogIndex = index
 		}
+		//from snapshort
 	}
 }
 
 func (p *Peer) newEntry(prevLogTerm uint64, logEntries []log.LogEntry) *protocol.Entry {
 	entry := protocol.Entry{
-		Term:         p.server.currentTerm(),
+		Term:         p.server.Term(),
 		LeaderID:     p.leaderID,
 		PrevLogIndex: p.prevLogIndex,
 		PrevLogTerm:  prevLogTerm,

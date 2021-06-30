@@ -56,7 +56,7 @@ func (s *Server) loop() {
 				return
 			default:
 			}
-			switch s.currentRole() {
+			switch s.Role() {
 			case Follower:
 				s.loopFollower()
 			case Candidate:
@@ -78,7 +78,7 @@ func (s *Server) loopFollower() {
 		case <-s.context.Done():
 			return
 		case <-randTimer.RawC():
-			s.convertToRole(Candidate)
+			s.SetRole(Candidate)
 			return
 		case e, ok := <-s.eventQueue.RawChan():
 			if !ok {
@@ -105,7 +105,7 @@ func (s *Server) loopFollower() {
 }
 
 func (s *Server) handleEntryOnFollower(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	entry := wrapper.GetEntry()
 	conn := handler.(*connector.Connector)
 	if term > entry.Term {
@@ -129,8 +129,7 @@ func (s *Server) handleEntryOnFollower(wrapper *protocol.Wrapper, handler interf
 		s.logManager.UpdateCommitIndex(entry.LeaderCommit)
 		return true
 	} else {
-		s.setTerm(entry.Term)
-		s.voteFor(entry.LeaderID)
+		s.ConvertToFollower(entry.Term, entry.LeaderID)
 		//与Leader的Term不比配, 返回Failure通知Leader
 		resp := protocol.NewEntryResp(term, 0, protocol.Failure)
 		s.sendResp(conn, resp)
@@ -139,14 +138,15 @@ func (s *Server) handleEntryOnFollower(wrapper *protocol.Wrapper, handler interf
 }
 
 func (s *Server) handleVoteOnFollower(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	vote := wrapper.GetVote()
 	conn := handler.(*connector.Connector)
 	if term > vote.Term {
 		resp := protocol.NewVoteResp(term, protocol.Disagree)
 		s.sendResp(conn, resp)
 	} else if term == vote.Term {
-		if s.votedFor != 0 && s.votedFor != vote.CandidateID {
+		if s.VoteFor() != 0 &&
+			s.VoteFor() != vote.CandidateID {
 			resp := protocol.NewVoteResp(term, protocol.Disagree)
 			s.sendResp(conn, resp)
 			return false
@@ -156,7 +156,7 @@ func (s *Server) handleVoteOnFollower(wrapper *protocol.Wrapper, handler interfa
 			s.sendResp(conn, resp)
 			return false
 		}
-		s.votedFor = vote.CandidateID
+		s.SetVoteFor(vote.CandidateID)
 		resp := protocol.NewVoteResp(term, protocol.Granted)
 		s.sendResp(conn, resp)
 	} else {
@@ -165,9 +165,8 @@ func (s *Server) handleVoteOnFollower(wrapper *protocol.Wrapper, handler interfa
 			s.sendResp(conn, resp)
 			return false
 		}
-		s.setTerm(vote.Term)
-		s.voteFor(vote.CandidateID)
-		resp := protocol.NewVoteResp(s.term, protocol.Granted)
+		s.ConvertToFollower(vote.Term, vote.CandidateID)
+		resp := protocol.NewVoteResp(vote.Term, protocol.Granted)
 		s.sendResp(conn, resp)
 	}
 	return true
@@ -180,12 +179,10 @@ func (s *Server) loopCandidate() {
 launchVote:
 	for {
 		randTimer.Reset()
-		term := s.increaseTerm()
-		s.voteFor(s.config.Local.ID)
+		term := s.LaunchVote(s.config.Local.ID)
 		voteBox := newVoteBox(s.config.Local.ID, s.quorum())
 
-		s.peers.Range(func(key, value interface{}) bool {
-			peer := value.(*Peer)
+		s.peers.foreach(func(peer *Peer) bool {
 			peer.vote(s, term, func(id uint64, resp *protocol.VoteResp) {
 				voteBox.record(id, resp.VoteGranted == protocol.Granted)
 			})
@@ -194,7 +191,7 @@ launchVote:
 
 		for {
 			if voteBox.isWin() {
-				s.convertToRole(Leader)
+				s.SetRole(Leader)
 				return
 			}
 			select {
@@ -229,22 +226,19 @@ launchVote:
 }
 
 func (s *Server) handleEntryOnCandidate(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	entry := wrapper.GetEntry()
 	conn := handler.(*connector.Connector)
 	if term > entry.Term {
 		resp := protocol.NewEntryResp(term, 0, protocol.Failure)
 		s.sendResp(conn, resp)
 	} else if term == entry.Term {
-		s.voteFor(entry.LeaderID)
-		s.convertToRole(Follower)
+		s.ConvertToFollower(term, entry.LeaderID)
 		resp := protocol.NewEntryResp(term, entry.PrevLogIndex, protocol.Failure)
 		s.sendResp(conn, resp)
 		return true
 	} else {
-		s.setTerm(entry.Term)
-		s.voteFor(entry.LeaderID)
-		s.convertToRole(Follower)
+		s.ConvertToFollower(entry.Term, entry.LeaderID)
 		resp := protocol.NewEntryResp(term, 0, protocol.Failure)
 		s.sendResp(conn, resp)
 		return true
@@ -253,7 +247,7 @@ func (s *Server) handleEntryOnCandidate(wrapper *protocol.Wrapper, handler inter
 }
 
 func (s *Server) handleVoteOnCandidate(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	vote := wrapper.GetVote()
 	conn := handler.(*connector.Connector)
 	if term >= vote.Term {
@@ -264,9 +258,7 @@ func (s *Server) handleVoteOnCandidate(wrapper *protocol.Wrapper, handler interf
 			resp := protocol.NewVoteResp(term, protocol.Disagree)
 			s.sendResp(conn, resp)
 		} else {
-			s.setTerm(vote.Term)
-			s.voteFor(vote.CandidateID)
-			s.convertToRole(Follower)
+			s.ConvertToFollower(vote.Term, vote.CandidateID)
 			resp := protocol.NewVoteResp(term, protocol.Granted)
 			s.sendResp(conn, resp)
 			return true
@@ -318,7 +310,7 @@ func (s *Server) loopLeader() {
 }
 
 func (s *Server) handleEntryOnLeader(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	entry := wrapper.GetEntry()
 	conn := handler.(*connector.Connector)
 	if term > entry.Term {
@@ -329,9 +321,7 @@ func (s *Server) handleEntryOnLeader(wrapper *protocol.Wrapper, handler interfac
 		s.logger.Warnf("收到来自远端[%v]的Entry信息, 可能已发生脑裂", conn.Remote())
 		s.sendResp(conn, resp)
 	} else {
-		s.setTerm(entry.Term)
-		s.voteFor(entry.LeaderID)
-		s.convertToRole(Follower)
+		s.ConvertToFollower(entry.Term, entry.LeaderID)
 		resp := protocol.NewEntryResp(term, 0, protocol.Failure)
 		s.sendResp(conn, resp)
 		return true
@@ -340,7 +330,7 @@ func (s *Server) handleEntryOnLeader(wrapper *protocol.Wrapper, handler interfac
 }
 
 func (s *Server) handleVoteOnLeader(wrapper *protocol.Wrapper, handler interface{}) bool {
-	term := s.currentTerm()
+	term := s.Term()
 	vote := wrapper.GetVote()
 	conn := handler.(*connector.Connector)
 	if term >= vote.Term {
@@ -351,9 +341,7 @@ func (s *Server) handleVoteOnLeader(wrapper *protocol.Wrapper, handler interface
 			resp := protocol.NewVoteResp(term, protocol.Disagree)
 			s.sendResp(conn, resp)
 		} else {
-			s.setTerm(vote.Term)
-			s.voteFor(vote.CandidateID)
-			s.convertToRole(Follower)
+			s.ConvertToFollower(vote.Term, vote.CandidateID)
 			resp := protocol.NewVoteResp(term, protocol.Granted)
 			s.sendResp(conn, resp)
 			return true
@@ -364,14 +352,14 @@ func (s *Server) handleVoteOnLeader(wrapper *protocol.Wrapper, handler interface
 
 func (s *Server) handleClientReq(e *event.Event) {
 	handler := e.Handler.(event.ClientHandler)
-	if s.currentRole() != Leader {
+	if s.Role() != Leader {
 		err := errors.New("当前节点角色不是Leader, 无法处理Client请求")
 		handler(false, err)
 	} else {
 		//添加日志
 		data := e.Data.(event.ClientData)
 		logEntry := s.funcNewLogEntry(data.ToBytes())
-		if index, err := s.logManager.AppendLogEntryByLeader(s.currentTerm(), logEntry); err != nil {
+		if index, err := s.logManager.AppendLogEntryByLeader(s.Term(), logEntry); err != nil {
 			handler(false, err)
 		} else {
 			s.notifyClient.Store(index, handler)
@@ -382,21 +370,20 @@ func (s *Server) handleClientReq(e *event.Event) {
 func (s *Server) updateCommitIndex() {
 	count := 0
 	slice := make([]uint64, len(s.config.Cluster))
-	s.peers.Range(func(key, value interface{}) bool {
-		slice[count] = (value.(*Peer)).currentMatchedIndex()
+
+	s.peers.foreach(func(peer *Peer) bool {
+		slice[count] = peer.currentMatchedIndex()
 		count++
 		return true
 	})
 	//sort
-	count = 0
-	quorum := s.quorum()
 	sort.Sort(sort.Reverse(util.UintSlice(slice)))
-	s.logManager.UpdateCommitIndex(slice[quorum-1])
+	s.logManager.UpdateCommitIndex(slice[len(slice)/2])
 }
 
 func (s *Server) peerConvert(state byte) {
-	s.peers.Range(func(key, value interface{}) bool {
-		(value.(*Peer)).convert(state)
+	s.peers.foreach(func(peer *Peer) bool {
+		peer.convert(state)
 		return true
 	})
 }
@@ -410,6 +397,6 @@ func (s *Server) sendResp(conn *connector.Connector, resp protocol.WrapperData) 
 		respType = "VoteResp"
 	}
 	if _, _, err := conn.Send(resp); err != nil {
-		s.logger.Errorf("处于角色%v下, 发送%v到远端[%v]失败-->%v", roleDescribe(s.currentRole()), respType, conn.Remote(), err.Error())
+		s.logger.Errorf("处于角色%v下, 发送%v到远端[%v]失败-->%v", roleDescribe(int(s.Role())), respType, conn.Remote(), err.Error())
 	}
 }
